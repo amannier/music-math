@@ -1,7 +1,10 @@
 import random
 import numpy as np
+import musicpy as mp
 from musicpy import *
 from read_data import readBars, readMainTracks
+import re
+from collections import Counter
 
 class GeneticAlgorithm:
     def __init__(
@@ -12,8 +15,6 @@ class GeneticAlgorithm:
         crossover_rate,
         selection_rate,
         generations,
-        key_name="C",
-        scale_type="major",
     ):
         self.mutation_rate = mutation_rate
         # Probability of mutation: which is the probability that a gene will change its value
@@ -26,11 +27,8 @@ class GeneticAlgorithm:
         self.fitness = fitness
 
         # 定义类中的调性
-        self.key_name = key_name
-        self.scale_type = scale_type
-
-        # 确定调性内的音符
-        self.tonality_notes = scale(key_name, scale_type).notes
+        self.key_name = None
+        self.scale_type = None
 
         # 定义音程质量评估（不和谐度）
         self.interval_values = [1, 3, 2, 1, 1, 2, 3, 1]
@@ -42,31 +40,54 @@ class GeneticAlgorithm:
         # 初始化均值和方差
         self._initialize_population_statistics()
 
+        # 确定调性内的音符
+        self.tonality_notes = scale(self.key_name, self.scale_type).notes
+
     def _initialize_population_statistics(self):
         """计算初始种群的音程均值和方差"""
+        all_tonalities = []
         all_intervals = []
-        for chrom in self.population:
+        for chord in self.population:
             # 提取每个个体的音程
-            intervals = chrom.intervalof(translate=True, cumulative=False)
+            current_scales = mp.alg.detect_scale3(chord, key_accuracy_tol=0.8)
+            all_tonalities.extend(re.findall(r'([A-G]#? major)', current_scales))
+            intervals = chord.intervalof(translate=True, cumulative=False)
             for interval in intervals:
                 if interval.number < 9:
                     all_intervals.append(self.interval_values[interval.number - 1])
                 else:
                     all_intervals.append(5)
+        counter = Counter(all_tonalities)
+        most_common_major = counter.most_common(1)[0]
+        print(f"初始种群中出现次数最多的调是: {most_common_major[0]}，占比为: {most_common_major[1]/len(all_tonalities)}")
+        self.key_name = most_common_major[0].split()[0]
+        self.scale_type = most_common_major[0].split()[1]
+
         self.initial_mean = np.mean(all_intervals)
         self.initial_variance = np.var(all_intervals)
 
     def _selection(self):
+        original_weights = []
+        for chord in self.population:
+            value = self.fitness(self.interval_values, self.initial_mean, self.initial_variance, self.tonality_notes, chord)
+            if math.isnan(value):
+                print(chord)
+                raise ValueError("Fitness function returns NaN")
+            original_weights.append(value)
+        # fitness函数是设计的值越小越好，所以这里要取倒数
+        inverted_weights = [1 / weight if weight != 0 else float('inf') for weight in original_weights]
+        
         selected = random.choices(
             self.population,
             k=int(self.selection_rate * len(self.population)),
-            weights=[self.fitness(self.interval_values, self.initial_mean, self.initial_variance, self.tonality_notes, chrom) for chrom in self.population],
+            weights=inverted_weights,
         )
+        selected = [chord for chord in selected if len(chord.notes) >= 10 and len(chord.notes) <= 60]
         return selected
 
     def _crossover(self, parent1, parent2):
         if random.random() < self.crossover_rate:
-            point = random.rand() * parent1.bars()
+            point = random.random() * parent1.bars()
             return parent1.cut(0, point) + parent2.cut(point, parent2.bars()), \
                    parent2.cut(0, point) + parent1.cut(point, parent1.bars())
         return parent1, parent2
@@ -79,7 +100,7 @@ class GeneticAlgorithm:
 
     def _create_new_population(self, selected):
         new_population = []
-        for i in range(0, self.population_size, 2):
+        for i in range(0, len(selected)-1, 2):
             parent1, parent2 = selected[i], selected[i + 1]
             offspring1, offspring2 = self._crossover(parent1, parent2)
             new_population.append(self._mutate(offspring1))
@@ -88,11 +109,11 @@ class GeneticAlgorithm:
 
     def run(self):
         from tqdm import tqdm
-        for generation in tqdm(range(self.generations)):
+        for generation in range(self.generations):
             selected = self._selection()
             self.population = self._create_new_population(selected)
-            best_fitness = max(self.fitness(self.interval_values, self.initial_mean, self.initial_variance, self.tonality_notes, chrom) for chrom in self.population)
-            best_genome = self.population[np.argmax([self.fitness(self.interval_values, self.initial_mean, self.initial_variance, self.tonality_notes, chrom) for chrom in self.population])]
+            best_fitness = min(self.fitness(self.interval_values, self.initial_mean, self.initial_variance, self.tonality_notes, chord) for chord in self.population)
+            best_genome = self.population[np.argmin([self.fitness(self.interval_values, self.initial_mean, self.initial_variance, self.tonality_notes, chord) for chord in self.population])]
             print(f"Epoch = {generation}; Best Fitness = {best_fitness}")
             yield best_genome, best_fitness
 
@@ -112,7 +133,7 @@ def _initialize_population():
     bars = readBars()
     filtered_bars = []
     for bar in bars:
-        if len(bar) < BAR_MIN_LENGTH or len(bar) > BAR_MAX_LENGTH:
+        if len(bar) < BAR_MIN_LENGTH or len(bar) > BAR_MAX_LENGTH or len(bar.notes) < 10 or len(bar.notes) > 60:
             continue
         filtered_bars.append(bar)
     return filtered_bars
@@ -130,7 +151,7 @@ def fitness(interval_values, initial_mean, initial_variance, tonality_notes, cho
     3. 比较与参考和弦（初始种群）的均值和方差。
     """
     # 超参
-    alpha, beta, gama = 1.0, 1.0, 1.0
+    alpha, beta, gama, delta = 1.0, 1.0, 0.2, 1
 
     fitness_score = 0
 
@@ -161,6 +182,8 @@ def fitness(interval_values, initial_mean, initial_variance, tonality_notes, cho
     # 将均值差异和方差差异加入到适应度中
     fitness_score += abs(mean - initial_mean) * alpha
     fitness_score += abs(variance - initial_variance) * beta
+    # 新添加一个惩罚音符太少的项
+    fitness_score += 1/(len(chord.notes)) * delta
 
     # 返回适应度分数（分数越低适应度越高）
     return fitness_score
